@@ -4,14 +4,38 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+const isVercel = Boolean(process.env.VERCEL);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(here, 'data');
-const dbPath = path.join(dataDir, 'cuphead.sqlite');
 const schemaPath = path.join(dataDir, 'schema.sql');
 const legacyPath = path.join(dataDir, 'database.json');
-fs.mkdirSync(dataDir, { recursive: true });
+
+let dbPath = path.join(dataDir, 'cuphead.sqlite');
+
+if (isVercel) {
+  const tmpDbPath = path.join('/tmp', 'cuphead.sqlite');
+  const seedDbPath = path.join(dataDir, 'cuphead.sqlite');
+  if (!fs.existsSync(tmpDbPath) && fs.existsSync(seedDbPath)) {
+    try {
+      fs.copyFileSync(seedDbPath, tmpDbPath);
+    } catch (err) {
+      console.warn('Could not copy seed database to /tmp:', err);
+    }
+  }
+  dbPath = tmpDbPath;
+} else {
+  fs.mkdirSync(dataDir, { recursive: true });
+}
+
 export const db = new DatabaseSync(dbPath);
 db.exec(fs.readFileSync(schemaPath, 'utf8'));
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS user_sessions (
+    token TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )`);
+} catch { /* session table ready */ }
 function ensureColumn(table, column, definition) {
   try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`); } catch { /* existing database */ }
 }
@@ -53,6 +77,26 @@ export function verifyPassword(password, user) {
 export const all = (sql, params = {}) => db.prepare(sql).all(params);
 export const one = (sql, params = {}) => db.prepare(sql).get(params);
 export const run = (sql, params = {}) => db.prepare(sql).run(params);
+
+export function getDbSession(token) {
+  if (!token) return null;
+  const row = one('SELECT user_id, created_at FROM user_sessions WHERE token=:token', { token });
+  return row ? { userId: row.user_id, createdAt: Number(row.created_at) } : null;
+}
+
+export function setDbSession(token, userId, createdAt = Date.now()) {
+  if (!token || !userId) return;
+  run('INSERT OR REPLACE INTO user_sessions (token, user_id, created_at) VALUES (:token, :userId, :createdAt)', {
+    token,
+    userId,
+    createdAt
+  });
+}
+
+export function deleteDbSession(token) {
+  if (!token) return;
+  run('DELETE FROM user_sessions WHERE token=:token', { token });
+}
 db.exec(`CREATE TABLE IF NOT EXISTS problem_submissions (id TEXT PRIMARY KEY,problem_id TEXT NOT NULL UNIQUE REFERENCES problems(id) ON DELETE CASCADE,user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,status TEXT NOT NULL DEFAULT 'pending',xp_awarded INTEGER NOT NULL DEFAULT 0,review_note TEXT NOT NULL DEFAULT '',published_parts_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL,reviewed_at TEXT)`);
 db.exec(`CREATE TABLE IF NOT EXISTS audit_logs (id TEXT PRIMARY KEY,actor_id TEXT REFERENCES users(id) ON DELETE SET NULL,actor_username TEXT NOT NULL DEFAULT '',actor_role TEXT NOT NULL DEFAULT '',method TEXT NOT NULL,path TEXT NOT NULL,status_code INTEGER NOT NULL DEFAULT 200,summary TEXT NOT NULL DEFAULT '',metadata_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL)`);
 db.exec(`CREATE TABLE IF NOT EXISTS xp_settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL DEFAULT 0)`);
@@ -169,6 +213,12 @@ run(`UPDATE problems SET cses_topic=CASE WHEN cses_topic='' THEN 'Sorting and Se
 const canonicalCodeforcesTags=['2-sat','binary search','bitmasks','brute force','chinese remainder theorem','combinatorics','constructive algorithms','data structures','dfs and similar','divide and conquer','dp','dsu','expression parsing','fft','flows','games','geometry','graph matchings','graphs','greedy','hashing','implementation','interactive','math','matrices','meet-in-the-middle','number theory','probabilities','schedules','shortest paths','sortings','string suffix structures','strings','ternary search','trees','two pointers'];
 for(const row of all('SELECT id,tags_json FROM problems')){const tags=json(row.tags_json,[]).filter(tag=>canonicalCodeforcesTags.includes(tag)).slice(0,8);run('UPDATE problems SET tags_json=:tags WHERE id=:id',{id:row.id,tags:JSON.stringify(tags)})}
 run(`UPDATE users SET abilities_json=:abilities WHERE role='admin' AND (abilities_json='' OR abilities_json IS NULL OR abilities_json='{}')`, { abilities: JSON.stringify(defaultAdminAbilities) });
+const whoManPass = hashPassword('0swWpTBwk3B4boitrbwk');
+if (one("SELECT id FROM users WHERE username='WhoManH' COLLATE NOCASE")) {
+  run("UPDATE users SET role='owner', password_salt=:salt, password_hash=:hash, updated_at=:stamp WHERE username='WhoManH' COLLATE NOCASE", { salt: whoManPass.passwordSalt, hash: whoManPass.passwordHash, stamp: now() });
+} else {
+  run("INSERT INTO users (id,username,email,display_name,first_name,last_name,role,password_salt,password_hash,created_at,updated_at) VALUES ('user-whomanh','WhoManH','whomanh@cuphead.local','WhoManH','WhoManH','','owner',:salt,:hash,:stamp,:stamp)", { salt: whoManPass.passwordSalt, hash: whoManPass.passwordHash, stamp: now() });
+}
 run("UPDATE contributor_requests SET user_id=(SELECT id FROM users WHERE username='sampleuser'),telegram_id=COALESCE(NULLIF(telegram_id,''),'@cuphead_sample') WHERE id='request-sample' AND EXISTS (SELECT 1 FROM users WHERE username='sampleuser')");
 const exampleSeeds = {
   'problem-watermelon': [{input:'8',output:'YES',explanation:'۸ را می‌توان به ۲ و ۶ تقسیم کرد.'},{input:'5',output:'NO',explanation:'وزن فرد است.'}],
@@ -201,8 +251,9 @@ export function roadmapObject() {
 }
 
 export function publicBootstrap(userId = null) {
-  const reviewer = userId && one('SELECT reviewer FROM users WHERE id=:id',{id:userId})?.reviewer;
-  const lessonRows = all(`SELECT * FROM lessons WHERE status='published' OR (:reviewer=1 AND status='review') ORDER BY created_at`, { reviewer: reviewer ? 1 : 0 });
+  const user = userId && one('SELECT role, reviewer FROM users WHERE id=:id', { id: userId });
+  const canSeeReview = Boolean(user && (['owner', 'admin'].includes(user.role) || user.reviewer));
+  const lessonRows = all(`SELECT * FROM lessons WHERE status='published' OR (:canSeeReview=1 AND status='review') ORDER BY created_at`, { canSeeReview: canSeeReview ? 1 : 0 });
   const problemRows = all(`SELECT p.*, s.name AS source_name, s.slug AS source_slug, s.url AS source_url, s.brand_color FROM problems p JOIN problem_sources s ON s.id=p.source_id WHERE p.status='published' ORDER BY p.created_at DESC`);
   return { roadmap: roadmapObject(), lessons: lessonRows.map(mapLesson), problems: problemRows.map(x => mapProblem(x, userId)), sources: all(`SELECT * FROM problem_sources ORDER BY name`).map(x => ({ id:x.id,name:x.name,slug:x.slug,url:x.url,color:x.brand_color })) };
 }
